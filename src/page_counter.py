@@ -29,6 +29,7 @@ def get_word_page_count(filepath):
     """
     Extract page count from .docx file.
     Word stores document statistics in docProps/app.xml.
+    Also tries WPS Office and other compatible formats.
     Returns int page count or None if unavailable.
     """
     try:
@@ -38,13 +39,32 @@ def get_word_page_count(filepath):
             with z.open('docProps/app.xml') as app_xml:
                 tree = ET.parse(app_xml)
                 root = tree.getroot()
-                # Namespaces in app.xml
+
+                # Method 1: Standard Word namespace with prefix
                 ns = {
                     'ep': 'http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'
                 }
                 pages_elem = root.find('.//ep:Pages', ns)
                 if pages_elem is not None and pages_elem.text:
                     return int(pages_elem.text)
+
+                # Method 2: Default namespace (no prefix)
+                pages_elem = root.find(
+                    './/{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}Pages'
+                )
+                if pages_elem is not None and pages_elem.text:
+                    return int(pages_elem.text)
+
+                # Method 3: Namespace-agnostic search (for WPS, LibreOffice, etc.)
+                for elem in root.iter():
+                    tag = elem.tag
+                    if '}' in tag:
+                        tag = tag.split('}', 1)[1]
+                    if tag == 'Pages' and elem.text:
+                        try:
+                            return int(elem.text)
+                        except ValueError:
+                            continue
         return None
     except Exception:
         return None
