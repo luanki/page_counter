@@ -12,6 +12,7 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import zipfile
 import xml.etree.ElementTree as ET
+import subprocess
 from datetime import datetime
 
 try:
@@ -25,13 +26,8 @@ except ImportError:
     Workbook = None
 
 
-def get_word_page_count(filepath):
-    """
-    Extract page count from .docx file.
-    Word stores document statistics in docProps/app.xml.
-    Also tries WPS Office and other compatible formats.
-    Returns int page count or None if unavailable.
-    """
+def _get_pages_from_app_xml(filepath):
+    """Extract page count from docProps/app.xml metadata."""
     try:
         with zipfile.ZipFile(filepath, 'r') as z:
             if 'docProps/app.xml' not in z.namelist():
@@ -70,6 +66,109 @@ def get_word_page_count(filepath):
         return None
 
 
+def _get_pages_from_com_windows(filepath):
+    """Use Windows COM interface (Word/WPS) to get accurate page count."""
+    if sys.platform != 'win32':
+        return None
+    try:
+        safe_path = filepath.replace("'", "''")
+        ps_script = f"""
+try {{
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $doc = $word.Documents.Open('{safe_path}')
+    $pages = $doc.ComputeStatistics(2)
+    $doc.Close($false)
+    $word.Quit()
+    Write-Output $pages
+}} catch {{
+    try {{
+        $wps = New-Object -ComObject Kwps.Application
+        $wps.Visible = $false
+        $doc = $wps.Documents.Open('{safe_path}')
+        $pages = $doc.ComputeStatistics(2)
+        $doc.Close($false)
+        $wps.Quit()
+        Write-Output $pages
+    }} catch {{
+        Write-Output "ERROR"
+    }}
+}}
+"""
+        result = subprocess.run(
+            ['powershell', '-Command', ps_script],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            if output and output != 'ERROR' and output.isdigit():
+                return int(output)
+    except Exception:
+        pass
+    return None
+
+
+def _estimate_word_pages(filepath):
+    """Estimate page count from document content using python-docx."""
+    try:
+        from docx import Document
+        doc = Document(filepath)
+
+        total_chars = 0
+        image_count = 0
+        table_rows = 0
+
+        for para in doc.paragraphs:
+            total_chars += len(para.text)
+
+        for rel in doc.part.rels.values():
+            if rel.reltype and 'image' in rel.reltype:
+                image_count += 1
+
+        for table in doc.tables:
+            table_rows += len(table.rows)
+
+        # Rough estimation: A4 default settings, ~600 chars per page
+        chars_per_page = 600
+        text_pages = max(1, total_chars // chars_per_page)
+        if total_chars % chars_per_page > chars_per_page * 0.3:
+            text_pages += 1
+
+        image_pages = image_count * 0.5
+        table_pages = table_rows * 0.5
+
+        estimated = int(text_pages + image_pages + table_pages)
+        return max(1, estimated)
+    except Exception:
+        return None
+
+
+def get_word_page_count(filepath):
+    """
+    Extract page count from .docx using multiple methods.
+    Returns tuple: (pages, source)
+    source can be: 'app_xml', 'com', 'estimate', None
+    """
+    # Method 1: app.xml metadata (fast, accurate for Office)
+    pages = _get_pages_from_app_xml(filepath)
+    if pages is not None:
+        return pages, 'app_xml'
+
+    # Method 2: Windows COM interface (accurate if Word/WPS installed)
+    pages = _get_pages_from_com_windows(filepath)
+    if pages is not None:
+        return pages, 'com'
+
+    # Method 3: Content estimation (fallback)
+    pages = _estimate_word_pages(filepath)
+    if pages is not None:
+        return pages, 'estimate'
+
+    return None, None
+
+
 def get_pdf_page_count(filepath):
     """Extract page count from PDF file."""
     if PdfReader is None:
@@ -83,8 +182,7 @@ def get_pdf_page_count(filepath):
 
 def scan_files(folder_path, read_word=True, read_pdf=True):
     """
-    Generator that yields (filename, file_type, page_count, status)
-    for each supported file found.
+    Generator that yields file info for each supported file found.
     """
     if not os.path.isdir(folder_path):
         return
@@ -108,17 +206,23 @@ def scan_files(folder_path, read_word=True, read_pdf=True):
         rel_path = os.path.relpath(filepath, folder_path)
 
         if ext == '.docx':
-            pages = get_word_page_count(filepath)
+            pages, source = get_word_page_count(filepath)
             file_type = 'Word'
         elif ext == '.pdf':
             pages = get_pdf_page_count(filepath)
+            source = 'app_xml'
             file_type = 'PDF'
         else:
             pages = None
+            source = None
             file_type = 'Unknown'
 
         if pages is None:
-            status = '无法读取'
+            status = 'WPS暂不支持（建议Word另存）'
+        elif source == 'estimate':
+            status = f'约 {pages} 页（估算）'
+        elif source == 'com':
+            status = f'{pages} 页'
         else:
             status = f'{pages} 页'
 
@@ -129,6 +233,7 @@ def scan_files(folder_path, read_word=True, read_pdf=True):
             'rel_path': rel_path,
             'file_type': file_type,
             'pages': pages,
+            'source': source,
             'status': status,
             'filepath': filepath
         }
@@ -207,7 +312,7 @@ class PageCounterApp:
         self.tree.column("文件名", width=400, anchor=tk.W)
         self.tree.column("类型", width=80, anchor=tk.CENTER)
         self.tree.column("页数", width=80, anchor=tk.CENTER)
-        self.tree.column("状态", width=100, anchor=tk.CENTER)
+        self.tree.column("状态", width=180, anchor=tk.CENTER)
 
         vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
@@ -337,7 +442,7 @@ class PageCounterApp:
             ws.column_dimensions['B'].width = 50
             ws.column_dimensions['C'].width = 15
             ws.column_dimensions['D'].width = 10
-            ws.column_dimensions['E'].width = 15
+            ws.column_dimensions['E'].width = 25
             ws.column_dimensions['F'].width = 80
             wb.save(filepath)
             messagebox.showinfo("成功", f"Excel 已导出到:\n{filepath}")
